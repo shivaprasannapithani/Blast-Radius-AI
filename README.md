@@ -1,177 +1,123 @@
-# Blast Radius AI — Graph-Based Incident Investigation Agent
+## Graph Data Model
 
-An AI-assisted SRE investigation tool that uses service dependency graphs, incident findings, recent changes, and ownership information to help engineers investigate service failures and understand their potential blast radius.
+Blast Radius AI uses **FalkorDB as its graph database** to represent service dependencies, ownership, recent changes, incidents, and investigation findings.
 
-## Overview
+### Node types
 
-During an incident, engineers need to understand which services may be affected, what changed recently, which historical findings may be relevant, and whom to contact.
+| Node | Purpose |
+|---|---|
+| `Service` | Represents a service, including its name and tier. |
+| `Team` | Represents the team responsible for services. |
+| `Person` | Represents an engineer who belongs to a team. |
+| `Change` | Represents a code or configuration change, including its author, timestamp, and summary. |
+| `Finding` | Stores investigation notes and lessons learned for future recall. |
 
-Blast Radius AI brings this information together through graph traversal and an investigation agent, helping engineers investigate dependencies and retrieve relevant operational context.
+### Relationships
 
-## Features
+| Relationship | Direction | Purpose |
+|---|---|---|
+| `DEPENDS_ON` | Consumer → Provider | Models service dependencies and supports blast-radius analysis. |
+| `OWNS` | Team → Service | Connects teams to the services they own. |
+| `MEMBER_OF` | Person → Team | Connects engineers to their teams. |
+| `TOUCHED` | Change → Service | Associates changes with affected services. |
+| `ABOUT` | Finding → Service | Links saved investigation findings to a service. |
 
-- **Blast-radius analysis:** Identify downstream services potentially affected by a service failure.
-- **Dependency path tracing:** Find paths between services and report the number of hops.
-- **Incident memory:** Retrieve previously saved findings and historical investigation notes.
-- **Recent change lookup:** Surface recent service changes as potential investigation leads.
-- **Ownership lookup:** Identify responsible teams and responders from modeled graph data.
-- **Unknown-service validation:** Reject unknown service names before running graph queries.
-- **Interactive interface:** Investigate services through a Streamlit UI.
-- **REST API:** Expose investigation functionality through FastAPI and Swagger UI.
+### Example dependency
 
-## Technology Stack
+A dependency chain such as:
 
-- **Language:** Python
-- **Frontend:** Streamlit
-- **Backend:** FastAPI
-- **Graph database:** FalkorDB
-- **Infrastructure:** Docker Compose
+`web-frontend → checkout-api → payments-api`
 
-## Architecture
+means that `web-frontend` depends on `checkout-api`, which depends on `payments-api`. If `payments-api` fails, the graph can be traversed in reverse dependency direction to identify potentially impacted consumers.
 
-```text
-User
- |
- v
-Streamlit UI
- |
- v
-FastAPI Investigation API
- |
- v
-Investigation Agent
- |
- +--> Service dependency traversal
- +--> Recent changes lookup
- +--> Saved findings retrieval
- +--> Ownership and responder lookup
- |
- v
-FalkorDB Graph
+## Cypher Queries and Graph Algorithms
+
+The application uses developer-defined Cypher queries through a Python `GraphStore` wrapper. User prompts do not generate arbitrary Cypher. Service names and other values are passed as query parameters.
+
+### 1. Find the blast radius
+
+```cypher
+MATCH p=(consumer:Service)-[:DEPENDS_ON*1..3]->
+         (target:Service {name: $name})
+RETURN DISTINCT
+    consumer.name,
+    consumer.tier,
+    length(p),
+    [n IN nodes(p) | n.name]
+ORDER BY length(p), consumer.name
 ```
 
-The agent combines graph-backed information into an investigation summary. Any potential relationship between a recent change and an incident should be treated as a lead, not proof of causation.
+**Purpose:** Finds upstream consumers that may be affected by a failed service, returning their tiers, hop counts, and dependency paths. The actual implementation allows a bounded depth of 1–5 hops.
 
-## Example Investigation
+### 2. Find a dependency path
 
-**Question:** What services could be impacted if `payments-api` fails?
-
-The current graph returns four impacted services:
-
-| Service | Tier | Hops |
-|---|---|---:|
-| `checkout-api` | tier-1 | 1 |
-| `refunds-worker` | tier-2 | 1 |
-| `status-page` | tier-3 | 2 |
-| `web-frontend` | tier-1 | 2 |
-
-**Saved incident evidence:** The graph contains findings describing increased payment failures and database connection pressure around incident `INC-2048`.
-
-**Recent change:** `chg-1042` records a payments retry-policy update. This is a potential investigation lead, not a confirmed root cause.
-
-**Ownership:** The current graph associates `payments-api` with `payments-team` and responder Asha Rao.
-
-## Getting Started
-
-### Prerequisites
-
-- Python installed
-- Docker Desktop installed and running
-- Git
-
-### 1. Clone the repository
-
-```bash
-git clone <YOUR_GITHUB_REPOSITORY_URL>
-cd blast-radius-ai
+```cypher
+MATCH p=(a:Service {name: $source})-[:DEPENDS_ON*1..5]->
+         (b:Service {name: $target})
+RETURN [n IN nodes(p) | n.name] AS path,
+       length(p) AS hops
+ORDER BY hops
+LIMIT 1
 ```
 
-### 2. Create and activate a virtual environment
+**Purpose:** Finds a directed dependency path between two services and returns the shortest path found by the query.
 
-**Windows PowerShell:**
+### 3. Identify service owners and responders
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```cypher
+MATCH (t:Team)-[:OWNS]->(s:Service)
+WHERE s.name IN $names
+OPTIONAL MATCH (p:Person)-[:MEMBER_OF]->(t)
+RETURN s.name, t.name, collect(p.name)
+ORDER BY s.name
 ```
 
-### 3. Install dependencies
+**Purpose:** Maps impacted services to their owning teams and team members, helping responders identify whom to contact.
 
-If the repository contains a `requirements.txt` file:
+### 4. Retrieve recent changes
 
-```powershell
-python -m pip install -r requirements.txt
+```cypher
+MATCH (c:Change)-[:TOUCHED]->(s:Service)
+WHERE s.name IN $names
+RETURN c.sha, c.at, c.author, c.summary, s.name
+ORDER BY c.at DESC
 ```
 
-### 4. Configure environment variables
+**Purpose:** Retrieves changes associated with the failed service and its impacted services. The application filters results by a configurable time window. Temporal correlation does not establish causation.
 
-Create a local `.env` file with the variables required by the application. Refer to `app/config.py` for the expected names and configuration defaults.
+### 5. Recall previous investigation findings
 
-Do not commit API keys, passwords, or other secrets.
-
-### 5. Start FalkorDB
-
-```powershell
-docker compose up -d
+```cypher
+MATCH (f:Finding)-[:ABOUT]->(s:Service {name: $name})
+RETURN f.text, f.at, f.session
+ORDER BY f.at DESC
+LIMIT $limit
 ```
 
-### 6. Seed the graph
+**Purpose:** Retrieves saved investigation notes for a service so earlier observations and lessons can inform subsequent investigations.
 
-```powershell
-python -m app.seed
+### 6. Save an investigation finding
+
+```cypher
+MATCH (s:Service {name: $name})
+CREATE (f:Finding {
+    text: $text,
+    at: $at,
+    session: $session
+})-[:ABOUT]->(s)
 ```
 
-### 7. Start the API
+**Purpose:** Persists a timestamped finding associated with a service for later retrieval.
 
-```powershell
-python -m uvicorn app.main:app --reload
-```
+## Graph Algorithms and Investigation Logic
 
-Open Swagger UI at:
+The current implementation relies on **bounded variable-length graph traversal**, directed path search, and application-side shortest-path selection for unique impacted services.
 
-`http://127.0.0.1:8000/docs`
+- **Blast-radius analysis:** Traverses incoming dependency paths toward the failed provider.
+- **Dependency-path analysis:** Searches directed paths up to five hops and requests the shortest result.
+- **Impact deduplication:** Keeps the first result for each impacted service after sorting by path length.
+- **Ownership resolution:** Joins impacted services to teams and responders.
+- **Change correlation:** Filters associated changes by timestamp and investigation window.
+- **Investigation memory:** Saves and retrieves findings linked to services.
 
-### 8. Start Streamlit
-
-Open a second terminal, activate the virtual environment, and run:
-
-```powershell
-python -m streamlit run ui.py
-```
-
-Open the local URL printed by Streamlit, usually:
-
-`http://localhost:8501`
-
-## Testing
-
-The following behaviors have been manually tested against the current graph data:
-
-- Retrieving saved findings for `payments-api`
-- Looking up recent changes
-- Identifying four impacted services
-- Retrieving service owners and responders
-- Tracing the path from `checkout-api` to `payments-api`
-- Rejecting an unknown service without running a graph query
-- Saving a finding and retrieving it from investigation history
-
-## Limitations
-
-- Results depend on the services, dependencies, changes, findings, and ownership records stored in the graph.
-- A dependency relationship indicates potential impact, not guaranteed failure propagation.
-- A recent change correlated with an incident does not establish causation.
-- Findings and responder information are only as complete and current as the underlying data.
-- This project has been functionally tested with its current dataset; production reliability and root-cause accuracy have not been established.
-
-## Future Improvements
-
-- Add graph visualization to make dependency paths easier to understand.
-- Deduplicate repeated incident findings.
-- Add evidence citations to individual investigation conclusions.
-- Improve incident-specific filtering and finding relevance ranking.
-- Add automated unit and integration tests.
-- Add structured logs, metrics, and production deployment configuration.
-
-## License
-
-Add a license if you intend to distribute this project publicly.
+These results describe the relationships represented in the graph. Missing graph edges, incomplete metadata, and temporal correlations can limit conclusions about real-world impact or root cause.
